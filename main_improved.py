@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import argparse
 import time
+import concurrent.futures
 from scripts import (
     download_video,
     transcribe_video,
@@ -97,6 +98,103 @@ def interactive_input_int(prompt_text):
             print(i18n("\nError: Number must be greater than 0."))
         except ValueError:
             print(i18n("\nError: The value you entered is not an integer. Please try again."))
+
+def process_single_segment(idx, segment, project_folder, face_model, face_mode, detection_intervals, args, sub_config):
+    """
+    Function to process a single segment in parallel.
+    Handles: Edit (Face Crop), Subtitle Adjustment, and Burning.
+    """
+    try:
+        title = segment.get("title", f"Segment_{idx}")
+        safe_title = "".join([c for c in title if c.isalnum() or c in " _-"]).strip()
+        safe_title = safe_title.replace(" ", "_")[:60]
+        base_name = f"{idx:03d}_{safe_title}"
+        
+        input_mp4 = os.path.join(project_folder, "cuts", f"{base_name}_original_scale.mp4")
+        if not os.path.exists(input_mp4):
+            print(f"[{idx}] Error: Input file not found: {input_mp4}")
+            return False
+
+        # 1. Edit (Face Crop)
+        print(f"\n[{idx}] Editing video: {base_name}...")
+        
+        # 1.1 First Pass: Edit + Timeline Generation
+        from scripts.edit_video import edit_single_file, INSIGHTFACE_AVAILABLE, init_insightface
+        
+        # Initialize InsightFace ONLY ONCE per process
+        global _INSIGHTFACE_LOADED
+        if INSIGHTFACE_AVAILABLE and face_model == "insightface":
+            try:
+                # We use a simple global flag to avoid multiple inits in the same process
+                if '_INSIGHTFACE_LOADED' not in globals():
+                    print(f"[{idx}] Initializing InsightFace in worker process...")
+                    init_insightface()
+                    globals()['_INSIGHTFACE_LOADED'] = True
+            except Exception as e:
+                print(f"[{idx}] Error initializing InsightFace: {e}")
+                return False
+        
+        # Determine detection intervals
+        detection_intervals = None
+        if args.face_detect_interval:
+            try:
+                parts = args.face_detect_interval.split(',')
+                if len(parts) == 1:
+                    val = float(parts[0])
+                    detection_intervals = {'1': val, '2': val}
+                elif len(parts) >= 2:
+                    val1 = float(parts[0])
+                    val2 = float(parts[1])
+                    detection_intervals = {'1': val1, '2': val2}
+            except: pass
+
+        # Run EDIT
+        success, mode = edit_single_file(input_mp4, project_folder, face_model, face_mode, detection_intervals, 
+                                         args.face_filter_threshold, args.face_two_threshold, args.face_confidence_threshold, 
+                                         float(args.face_dead_zone), args.focus_active_speaker, args.active_speaker_mar, 
+                                         args.active_speaker_score_diff, args.include_motion, args.active_speaker_motion_threshold, 
+                                         args.active_speaker_motion_sensitivity, args.active_speaker_decay, 
+                                         None, args.no_face_mode, 
+                                         True, False, False) # Assume insightface working if we are in this flow
+
+        if not success:
+            print(f"[{idx}] Edit failed for {base_name}")
+            return False
+
+        # 2. Subtitles Adjustment (Targeted at this segment)
+        print(f"[{idx}] Adjusting subtitles...")
+        json_sub = os.path.join(project_folder, "subs", f"{base_name}_processed.json")
+        ass_sub = os.path.join(project_folder, "subs_ass", f"{base_name}.ass")
+        
+        if os.path.exists(json_sub):
+            from scripts.adjust_subtitles import generate_ass_from_file
+            generate_ass_from_file(json_sub, ass_sub, project_folder, **sub_config)
+            
+            # 3. Burn Subtitles (Muxing + Burning + Finalizing)
+            print(f"[{idx}] Burning subtitles and finalizing...")
+            # We already have a temp video from edit_single_file: temp_video_no_audio_{idx}.mp4
+            # finalize_video_improved can be called again or we can have a dedicated burn call.
+            # Actually, finalize_video_improved already does muxing and burning if sub_path is provided.
+            # But it was already called inside edit_single_file without sub_path.
+            
+            # Let's do a FINAL BURN PASS
+            final_mp4 = os.path.join(project_folder, "final", f"{base_name}.mp4")
+            burned_mp4 = os.path.join(project_folder, "burned_sub", f"{base_name}_subtitled.mp4")
+            os.makedirs(os.path.join(project_folder, "burned_sub"), exist_ok=True)
+            
+            from scripts.burn_subtitles import burn_video_file
+            burn_success, msg = burn_video_file(final_mp4, ass_sub, burned_mp4)
+            if burn_success:
+                print(f"[{idx}] Completed: {burned_mp4}")
+            else:
+                print(f"[{idx}] Burn failed: {msg}")
+
+        return True
+    except Exception as e:
+        print(f"[{idx}] Error processing segment: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def main():
     # Configuração de Argumentos via Linha de Comando (CLI)
@@ -544,47 +642,45 @@ def main():
 
             cut_segments.cut(viral_segments, project_folder=project_folder, skip_video=skip_cutting)
         
+        # 4.5. Translate Subtitles (Prepare for Burning)
+        if workflow_choice != "2" and args.translate_target and args.translate_target.lower() != "none":
+             print(i18n("Translating subtitles to: {}").format(args.translate_target))
+             import asyncio
+             try:
+                # This should be done sequentially as it's an API/LLM call usually
+                asyncio.run(translate_json.translate_project_subs(project_folder, args.translate_target))
+             except Exception as e:
+                print(i18n("Translation failed: {}").format(e))
+        
         # 5. Workflow Check
         if workflow_choice == "2":
             print(i18n("Cut Only selected. Skipping Face Crop and Subtitles."))
             print(i18n(f"Process completed! Check your results in: {project_folder}"))
             sys.exit(0)
 
-        # 5. Edit Video (Face Crop)
+        # 5. Parallel Processing (Face Crop, Subtitles, Burn)
         if workflow_choice != "3":
-            print(i18n("Editing video with {} (Mode: {})...").format(face_model, face_mode))
+            print(i18n("\nStarting Parallel Processing of Segments..."))
+            segments_data = viral_segments.get("segments", [])
+            sub_config = get_subtitle_config(args.subtitle_config)
             
-            # Parse dead zone safely
-            try:
-                dead_zone_val = float(args.face_dead_zone)
-            except:
-                dead_zone_val = 40.0
+            # Use T4 friendly worker count (2-3 simultaneous InsightFace instances)
+            max_workers = 2 
+            
+            results = []
+            with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+                futures = [executor.submit(process_single_segment, idx, seg, project_folder, face_model, face_mode, detection_intervals, args, sub_config) 
+                           for idx, seg in enumerate(segments_data)]
                 
-            edit_video.edit(
-                project_folder=project_folder, 
-                face_model=face_model, 
-                face_mode=face_mode, 
-                detection_period=detection_intervals,
-                filter_threshold=args.face_filter_threshold,
-                two_face_threshold=args.face_two_threshold,
-                confidence_threshold=args.face_confidence_threshold,
-                dead_zone=dead_zone_val,
-                focus_active_speaker=args.focus_active_speaker,
-                active_speaker_mar=args.active_speaker_mar,
-                active_speaker_score_diff=args.active_speaker_score_diff,
-                include_motion=args.include_motion,
-                active_speaker_motion_deadzone=args.active_speaker_motion_threshold,
-                active_speaker_motion_sensitivity=args.active_speaker_motion_sensitivity,
-                active_speaker_decay=args.active_speaker_decay,
-                segments_data=viral_segments.get("segments", []) if viral_segments else None,
-                no_face_mode=args.no_face_mode
-            )
-
-
+                for future in concurrent.futures.as_completed(futures):
+                    results.append(future.result())
+            
+            print(i18n("\nParallel Processing Completed. {}/{} segments succeeded.").format(sum(results), len(results)))
         else:
-            print(i18n("Workflow 3: Skipping Face Crop."))
-            # Rename existing files if viral_segments available (since edit_video didn't run)
-            if viral_segments and "segments" in viral_segments:
+             # Workflow 3 Logic (Existing)
+             print(i18n("Workflow 3: Skipping Face Crop."))
+             # Rename existing files if viral_segments available (since edit_video didn't run)
+             if viral_segments and "segments" in viral_segments:
                  segments_data = viral_segments.get("segments", [])
                  final_folder = os.path.join(project_folder, "final")
                  subs_folder = os.path.join(project_folder, "subs")
@@ -620,41 +716,6 @@ def main():
                      if os.path.exists(old_tl_path) and not os.path.exists(new_tl_path):
                          os.rename(old_tl_path, new_tl_path)
                          print(f"Renamed (Workflow 3): {old_tl_name} -> {new_base_name}_timeline.json")
-
-        # 6. Subtitles
-        burn_subtitles_option = True 
-        if burn_subtitles_option:
-            print(i18n("Processing subtitles..."))
-            # transcribe_cuts removido: JSON de legenda já é gerado no corte
-            # transcribe_cuts.transcribe(project_folder=project_folder)
-            
-            # --- Translation Integration ---
-            if args.translate_target and args.translate_target.lower() != "none":
-                 print(i18n("Translating subtitles to: {}").format(args.translate_target))
-                 import asyncio
-                 try:
-                    asyncio.run(translate_json.translate_project_subs(project_folder, args.translate_target))
-                 except Exception as e:
-                    print(i18n("Translation failed: {}").format(e))
-            # -------------------------------
-
-            sub_config = get_subtitle_config(args.subtitle_config)
-            
-
-            
-            # Passa o dicionário desempacotado como argumentos, mais o project_folder
-            try:
-                adjust_subtitles.adjust(project_folder=project_folder, **sub_config)
-                burn_subtitles.burn(project_folder=project_folder)
-            except FileNotFoundError as fnf_error:
-                print(i18n("\n[ERROR] Subtitle processing failed: {}").format(str(fnf_error)))
-                print(i18n("Tip: If you are using Workflow 3 (Subtitles Only), ensure the 'subs' folder exists and contains valid JSON files."))
-                sys.exit(1)
-            except Exception as e:
-                print(i18n("\n[ERROR] Unexpected error during subtitle processing: {}").format(str(e)))
-                raise e
-        else:
-            print(i18n("Subtitle burning skipped."))
 
         # Organização Final (Opcional, pois agora já está tudo em project_folder)
         # organize_output.organize(project_folder=project_folder)

@@ -267,9 +267,12 @@ def transcribe(input_file, model_name='large-v3', project_folder='tmp'):
                 asr_options={"hotwords": None}
             )
 
+            # T4 GPU (16GB) handles batch_size=32 comfortably
+            batch_size = 32 if device == "cuda" else 16
+            
             result = model.transcribe(
                 audio, 
-                batch_size=16, 
+                batch_size=batch_size, 
                 chunk_size=10
             )
             
