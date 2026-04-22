@@ -175,42 +175,7 @@ def apply_experimental_preset(preset_name):
     p = EXPERIMENTAL_PRESETS[preset_name]
     return p["focus"], p["mar"], p["score"], p["motion"], p["motion_th"], p["motion_sens"], p["decay"]
 
-def is_relevant_log(line: str) -> bool:
-    """Filters out noisy/technical logs from the WebUI console."""
-    if not line or not line.strip():
-        return False
-        
-    line = line.strip()
-    
-    # Noise patterns
-    junk_patterns = [
-        "frame=", "fps=", "q=", "size=", "time=", "bitrate=", "speed=",  # FFmpeg stats
-        "OneVPL-res-trace", "ONNX Runtime info", "Initialized Successfully", # Library init
-        "DEBUG: Frame", "DEBUG: Filtered", "DEBUG: Filter Thresh", # Too verbose dev logs
-        "Tensorflow:", "Using cache found in", "Loading model" # Startup noise
-    ]
-    
-    # Specific exceptions we DO want to see
-    keep_patterns = [
-        "Project Folder:", "Transcribing...", "Cutting segments...", "Editing video...",
-        "Completed:", "Error:", "Warning:", "Success", "Starting Parallel"
-    ]
-    
-    # If it contains an exception keep pattern, it's relevant
-    for p in keep_patterns:
-        if p in line:
-            return True
-            
-    # If it contains a junk pattern, it's NOT relevant
-    for p in junk_patterns:
-        if p in line:
-            return False
-            
-    # Default: keep short descriptive lines, skip very long technical ones
-    if len(line) > 200:
-        return False
-        
-    return True
+# Subtitle logic moved to subtitle_handler.py
 
 
 def run_viral_cutter(input_source, project_name, url, video_file, segments, viral, themes, min_duration, max_duration, model, ai_backend, api_key, ai_model_name, chunk_size, workflow, face_model, face_mode, face_detect_interval, no_face_mode, 
@@ -352,9 +317,7 @@ def run_viral_cutter(input_source, project_name, url, video_file, segments, vira
                 break
             
             if line:
-                if is_relevant_log(line):
-                    logs += line
-                
+                logs += line
                 if "Project Folder:" in line:
                     parts = line.split("Project Folder:")
                     if len(parts) > 1: project_folder_path = parts[1].strip()
