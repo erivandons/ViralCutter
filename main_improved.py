@@ -149,13 +149,13 @@ def process_single_segment(idx, segment, project_folder, face_model, face_mode, 
             except: pass
 
         # Run EDIT
-        success, detected_mode = edit_single_file(input_mp4, project_folder, face_model, face_mode, detection_intervals, 
+        success, mode = edit_single_file(input_mp4, project_folder, face_model, face_mode, detection_intervals, 
                                          args.face_filter_threshold, args.face_two_threshold, args.face_confidence_threshold, 
                                          float(args.face_dead_zone), args.focus_active_speaker, args.active_speaker_mar, 
                                          args.active_speaker_score_diff, args.include_motion, args.active_speaker_motion_threshold, 
                                          args.active_speaker_motion_sensitivity, args.active_speaker_decay, 
                                          None, args.no_face_mode, 
-                                         True, False, False, finalize=False) # Skip internal finalization
+                                         True, False, False) # Assume insightface working if we are in this flow
 
         if not success:
             print(f"[{idx}] Edit failed for {base_name}")
@@ -169,24 +169,25 @@ def process_single_segment(idx, segment, project_folder, face_model, face_mode, 
         if os.path.exists(json_sub):
             from scripts.adjust_subtitles import generate_ass_from_file
             generate_ass_from_file(json_sub, ass_sub, project_folder, **sub_config)
-                     # 3. Finalize: Mux + Burn + Rename (One Pass)
-            print(f"[{idx}] Finalizing video with subtitles (One-Pass)...")
-            from scripts.edit_video import finalize_video_improved
             
-            output_no_audio = os.path.join(project_folder, "final", f"temp_video_no_audio_{idx}.mp4")
-            finalize_video_improved(input_mp4, output_no_audio, idx, project_folder, 
-                                    os.path.join(project_folder, "final"), base_name, 
-                                    subtitle_path=ass_sub, detected_mode=detected_mode)
+            # 3. Burn Subtitles (Muxing + Burning + Finalizing)
+            print(f"[{idx}] Burning subtitles and finalizing...")
+            # We already have a temp video from edit_single_file: temp_video_no_audio_{idx}.mp4
+            # finalize_video_improved can be called again or we can have a dedicated burn call.
+            # Actually, finalize_video_improved already does muxing and burning if sub_path is provided.
+            # But it was already called inside edit_single_file without sub_path.
             
-            print(f"[{idx}] Completed: {base_name}.mp4")
-        else:
-            # If no subtitles, still need to finalize
-            print(f"[{idx}] No subtitles found. Finalizing video only...")
-            from scripts.edit_video import finalize_video_improved
-            output_no_audio = os.path.join(project_folder, "final", f"temp_video_no_audio_{idx}.mp4")
-            finalize_video_improved(input_mp4, output_no_audio, idx, project_folder, 
-                                    os.path.join(project_folder, "final"), base_name, 
-                                    detected_mode=detected_mode)
+            # Let's do a FINAL BURN PASS
+            final_mp4 = os.path.join(project_folder, "final", f"{base_name}.mp4")
+            burned_mp4 = os.path.join(project_folder, "burned_sub", f"{base_name}_subtitled.mp4")
+            os.makedirs(os.path.join(project_folder, "burned_sub"), exist_ok=True)
+            
+            from scripts.burn_subtitles import burn_video_file
+            burn_success, msg = burn_video_file(final_mp4, ass_sub, burned_mp4)
+            if burn_success:
+                print(f"[{idx}] Completed: {burned_mp4}")
+            else:
+                print(f"[{idx}] Burn failed: {msg}")
 
         return True
     except Exception as e:

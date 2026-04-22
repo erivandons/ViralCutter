@@ -157,7 +157,7 @@ def generate_short_fallback(input_file, output_file, index, project_folder, fina
     process.stdin.close()
     process.wait()
     
-    return no_face_mode
+    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
 
 def finalize_video(input_file, output_file, index, fps, project_folder, final_folder):
     """Mux audio and video."""
@@ -362,7 +362,8 @@ def generate_short_mediapipe(input_file, output_file, index, face_mode, project_
 
         cap.release()
         out.release()
-        return no_face_mode
+        
+        finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
 
     except Exception as e:
         print(f"Error in MediaPipe processing: {e}")
@@ -466,7 +467,12 @@ def generate_short_haar(input_file, output_file, index, project_folder, final_fo
 
     cap.release()
     out.release()
-    return no_face_mode
+    
+    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
+
+    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
+
+    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
 
 def generate_short_insightface(input_file, output_file, index, project_folder, final_folder, face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, no_face_mode="padding"):
     """Face detection using InsightFace (SOTA)."""
@@ -1071,13 +1077,15 @@ def generate_short_insightface(input_file, output_file, index, project_folder, f
     except Exception as e:
         print(f"Error saving coords: {e}")
 
+    finalize_video(input_file, output_file, index, fps, project_folder, final_folder)
+    
     # Return dominant mode logic (or keep 15% rule as overall fallback)
     if frame_2_face_count > (total_frames * 0.15):
         return "2"
     return "1"
 
 
-def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="zoom"):
+def edit(project_folder="tmp", face_model="insightface", face_mode="auto", detection_period=None, filter_threshold=0.35, two_face_threshold=0.60, confidence_threshold=0.30, dead_zone=40, focus_active_speaker=False, active_speaker_mar=0.03, active_speaker_score_diff=1.5, include_motion=False, active_speaker_motion_deadzone=3.0, active_speaker_motion_sensitivity=0.05, active_speaker_decay=2.0, segments_data=None, no_face_mode="padding"):
     # Lazy init solutions only when needed to avoid AttributeError if import failed partially
     mp_face_detection = None
     mp_face_mesh = None
@@ -1201,78 +1209,50 @@ def edit_single_file(input_file, project_folder, face_model, face_mode, detectio
     # ... Fallback logic would go here if needed ...
     # Simplified for parallel optimization: mainly InsightFace focus
     
-    # In parallel mode, we might need to load/save face_modes_log to a file to share between processes
-    # But for a single file, we can just return the mode.
-    
     if success:
-        if finalize:
-            # Finalize (Mux + Rename + Burn)
-            # Note: res is the detected_mode ("1", "2", or fallback)
-            finalize_video_improved(input_file, output_file, index, project_folder, final_folder, base_name_final, subtitle_path, detected_mode)
+        # Finalize (Mux + Rename)
+        finalize_video_improved(input_file, output_file, index, project_folder, final_folder, base_name_final, subtitle_path)
         return True, detected_mode
     return False, "1"
 
-def finalize_video_improved(input_file, output_file, index, project_folder, final_folder, base_name_final, subtitle_path=None, detected_mode="1"):
+def finalize_video_improved(input_file, output_file, index, project_folder, final_folder, base_name_final, subtitle_path=None):
     """Mux audio, optionally burn subtitles, and rename in ONE step."""
     audio_file = os.path.join(project_folder, "cuts", f"output-audio-{index}.aac")
-    
-    # Ensure intermediate video exists
-    if not os.path.exists(output_file):
-        print(f"[{index}] FATAL: Intermediate crop file not found: {output_file}")
-        return
-    
     # Fast audio extract
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", input_file, "-vn", "-acodec", "copy", audio_file], 
                    check=False, capture_output=True)
 
-    final_output = os.path.join(final_folder, f"{base_name_final}.mp4")
-    encoder_name, encoder_preset = get_best_encoder()
-    
-    command = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
-        "-i", output_file,
-    ]
-    
     if os.path.exists(audio_file) and os.path.getsize(audio_file) > 0:
-        command.extend(["-i", audio_file])
-        has_audio = True
-    else:
-        has_audio = False
+        final_output = os.path.join(final_folder, f"{base_name_final}.mp4")
+        encoder_name, encoder_preset = get_best_encoder()
         
-    # If subtitle provided, add filter
-    if subtitle_path and os.path.exists(subtitle_path):
-        sub_file_ffmpeg = subtitle_path.replace('\\', '/').replace(':', '\\:')
-        command.extend(["-vf", f"subtitles='{sub_file_ffmpeg}'"])
+        command = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-stats",
+            "-i", output_file,
+            "-i", audio_file
+        ]
         
-    command.extend([
-        "-c:v", encoder_name, "-preset", encoder_preset, "-b:v", "5M",
-    ])
-    
-    if has_audio:
-        command.extend(["-c:a", "aac", "-b:a", "192k", "-map", "0:v:0", "-map", "1:a:0"])
-    else:
-        command.extend(["-c:a", "copy"]) # Fallback if no audio found
+        # If subtitle provided, add filter
+        if subtitle_path and os.path.exists(subtitle_path):
+            sub_file_ffmpeg = subtitle_path.replace('\\', '/').replace(':', '\\:')
+            command.extend(["-vf", f"subtitles='{sub_file_ffmpeg}'"])
+            
+        command.extend([
+            "-c:v", encoder_name, "-preset", encoder_preset, "-b:v", "5M",
+            "-c:a", "aac", "-b:a", "192k",
+            final_output
+        ])
         
-    command.append(final_output)
-    
-    try:
-        subprocess.run(command, check=True)
-        print(f"[{index}] Finalized: {final_output} (Mode: {detected_mode})")
-        
-        # Log mode for this segment (used by shared process logic if needed)
-        mode_log_file = os.path.join(project_folder, "cuts", f"mode_{index}.txt")
         try:
-            with open(mode_log_file, "w") as f:
-                f.write(detected_mode)
-        except: pass
-        
-        # Cleanup intermediate but KEEP source
-        try:
-            if os.path.exists(audio_file): os.remove(audio_file)
-            if os.path.exists(output_file): os.remove(output_file)
-        except: pass
-    except Exception as e:
-        print(f"[{index}] Error finalizing: {e}")
+            subprocess.run(command, check=True)
+            print(f"[{index}] Finalized: {final_output}")
+            # Cleanup
+            try:
+                os.remove(audio_file)
+                os.remove(output_file)
+            except: pass
+        except Exception as e:
+            print(f"[{index}] Error finalizing: {e}")
  
         
     # Save Face Modes to JSON for subtitle usage
