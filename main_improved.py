@@ -11,8 +11,8 @@ warnings.filterwarnings("ignore")
 import json
 import shutil
 import subprocess
-import argparse
-import time
+import concurrent.futures
+import multiprocessing
 from scripts import (
     download_video,
     transcribe_video,
@@ -87,16 +87,57 @@ def get_subtitle_config(config_path=None):
     
     return config
 
-def interactive_input_int(prompt_text):
-    """Solicita um inteiro ao usuário via terminal."""
+def get_int_input(prompt, min_val=1):
     while True:
         try:
-            value = int(input(i18n(prompt_text)))
-            if value > 0:
+            value = int(input(prompt))
+            if value >= min_val:
                 return value
             print(i18n("\nError: Number must be greater than 0."))
         except ValueError:
             print(i18n("\nError: The value you entered is not an integer. Please try again."))
+
+def process_single_segment(idx, segment, project_folder, face_model, face_mode, detection_intervals, args):
+    """Function to process a single segment in parallel."""
+    try:
+        title = segment.get("title", f"Segment_{idx}")
+        safe_title = "".join([c for c in title if c.isalnum() or c in " _-"]).strip()
+        safe_title = safe_title.replace(" ", "_")[:60]
+        base_name = f"{idx:03d}_{safe_title}"
+        
+        input_mp4 = os.path.join(project_folder, "cuts", f"{base_name}_original_scale.mp4")
+        if not os.path.exists(input_mp4):
+            print(f"[{idx}] Error: Input file not found: {input_mp4}")
+            return False
+
+        # Edit (Face Crop)
+        print(f"\n[{idx}] Editing video: {base_name}...")
+        from scripts.edit_video import edit_single_file, INSIGHTFACE_AVAILABLE, init_insightface
+        
+        # Initialize InsightFace ONLY ONCE per process
+        global _INSIGHTFACE_LOADED
+        if INSIGHTFACE_AVAILABLE and face_model == "insightface":
+            try:
+                # We use a simple global flag to avoid multiple inits in the same process
+                if '_INSIGHTFACE_LOADED' not in globals():
+                    print(f"[{idx}] Initializing InsightFace in worker process...")
+                    init_insightface()
+                    globals()['_INSIGHTFACE_LOADED'] = True
+            except Exception as e:
+                print(f"[{idx}] Error initializing InsightFace: {e}")
+                return False
+        
+        success, mode = edit_single_file(input_mp4, project_folder, face_model, face_mode, detection_intervals, 
+                                         args.face_filter_threshold, args.face_two_threshold, args.face_confidence_threshold, 
+                                         float(args.face_dead_zone), args.focus_active_speaker, args.active_speaker_mar, 
+                                         args.active_speaker_score_diff, args.include_motion, args.active_speaker_motion_threshold, 
+                                         args.active_speaker_motion_sensitivity, args.active_speaker_decay, 
+                                         None, args.no_face_mode, 
+                                         True, False, False) # Assume insightface working if we are in this flow
+        return success, idx, mode
+    except Exception as e:
+        print(f"[{idx}] Error processing segment: {e}")
+        return False, idx, "1"
 
 def main():
     # Configuração de Argumentos via Linha de Comando (CLI)
@@ -550,35 +591,42 @@ def main():
             print(i18n(f"Process completed! Check your results in: {project_folder}"))
             sys.exit(0)
 
-        # 5. Edit Video (Face Crop)
+        # 5. Edit Video (Face Crop) - PARALLEL VERSION
         if workflow_choice != "3":
-            print(i18n("Editing video with {} (Mode: {})...").format(face_model, face_mode))
+            print(i18n("Editing videos in parallel (Workers: 2)..."))
             
-            # Parse dead zone safely
+            from scripts.edit_video import INSIGHTFACE_AVAILABLE
+            
+            segments = viral_segments.get("segments", []) if viral_segments else []
+            if not segments:
+                # Fallback to files in cuts folder
+                import glob
+                cuts_folder = os.path.join(project_folder, "cuts")
+                found_files = sorted(glob.glob(os.path.join(cuts_folder, "*_original_scale.mp4")))
+                segments = [{"title": os.path.basename(f).replace("_original_scale.mp4", "")} for f in found_files]
+
+            # Set spawn method for safe CUDA usage
             try:
-                dead_zone_val = float(args.face_dead_zone)
-            except:
-                dead_zone_val = 40.0
+                multiprocessing.set_start_method('spawn', force=True)
+            except RuntimeError:
+                pass
+
+            with concurrent.futures.ProcessPoolExecutor(max_workers=2) as executor:
+                futures = []
+                for idx, segment in enumerate(segments):
+                    futures.append(executor.submit(process_single_segment, idx, segment, project_folder, face_model, face_mode, detection_intervals, args))
                 
-            edit_video.edit(
-                project_folder=project_folder, 
-                face_model=face_model, 
-                face_mode=face_mode, 
-                detection_period=detection_intervals,
-                filter_threshold=args.face_filter_threshold,
-                two_face_threshold=args.face_two_threshold,
-                confidence_threshold=args.face_confidence_threshold,
-                dead_zone=dead_zone_val,
-                focus_active_speaker=args.focus_active_speaker,
-                active_speaker_mar=args.active_speaker_mar,
-                active_speaker_score_diff=args.active_speaker_score_diff,
-                include_motion=args.include_motion,
-                active_speaker_motion_deadzone=args.active_speaker_motion_threshold,
-                active_speaker_motion_sensitivity=args.active_speaker_motion_sensitivity,
-                active_speaker_decay=args.active_speaker_decay,
-                segments_data=viral_segments.get("segments", []) if viral_segments else None,
-                no_face_mode=args.no_face_mode
-            )
+                face_modes_log = {}
+                for future in concurrent.futures.as_completed(futures):
+                    success, idx, mode = future.result()
+                    face_modes_log[f"output{str(idx).zfill(3)}"] = mode
+                
+                # Save face modes for subtitles
+                modes_file = os.path.join(project_folder, "face_modes.json")
+                with open(modes_file, "w") as f:
+                    json.dump(face_modes_log, f)
+                
+                print(i18n("Parallel editing phase completed. Stats saved: {}").format(modes_file))
 
 
         else:

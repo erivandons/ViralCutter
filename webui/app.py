@@ -175,6 +175,43 @@ def apply_experimental_preset(preset_name):
     p = EXPERIMENTAL_PRESETS[preset_name]
     return p["focus"], p["mar"], p["score"], p["motion"], p["motion_th"], p["motion_sens"], p["decay"]
 
+# --- Log Filtering Logic ---
+UNWANTED_PATTERNS = [
+    "frame=", "bitrate=", "size=", "time=", "fps=", "speed=",
+    "Initializing InsightFace", "InsightFace Initialized",
+    "Applied providers: ['CUDAExecutionProvider']",
+    "Successfully created onnxruntime session",
+    "Applied providers: ['CPUExecutionProvider']",
+    "loading model: buffalo_l",
+    "detect:", "recognize:", "Using CPU for processing",
+    "TensorFlow version", "InsightFace using", "MediaPipe initialized",
+    "onnxruntime-gpu", "Checking CUDA availability",
+    "subprocess.run", "ffmpeg version", "built with", "configuration:",
+    "libavutil", "libavcodec", "libavformat", "libavdevice", "libavfilter", "libswscale", "libswresample", "libpostproc",
+    "Input #0", "Metadata:", "Duration:", "Stream #0", "Stream mapping:", "Press [q] to stop",
+    "video:", "audio:", "subtitle:", "other streams:", "global headers:", "muxing overhead:"
+]
+
+def should_skip_log_line(line):
+    # Skip lines that are just numbers or very short
+    line_trimmed = line.strip()
+    if not line_trimmed: return True
+    
+    # Filter by patterns
+    for p in UNWANTED_PATTERNS:
+        if p.lower() in line_trimmed.lower():
+            return True
+    return False
+
+def filter_logs(full_logs):
+    lines = full_logs.splitlines()
+    filtered = []
+    for line in lines:
+        if not should_skip_log_line(line):
+            filtered.append(line)
+    return "\n".join(filtered)
+# ---------------------------
+
 # Subtitle logic moved to subtitle_handler.py
 
 
@@ -325,14 +362,15 @@ def run_viral_cutter(input_source, project_name, url, video_file, segments, vira
                 # Throttle updates to avoid browser freeze (0.2s interval)
                 current_time = time.time()
                 if current_time - last_update_time > 0.2:
-                    yield logs, gr.update(visible=True, interactive=False), gr.update(visible=True), None
+                    filtered_logs = filter_logs(logs)
+                    yield filtered_logs, gr.update(visible=True, interactive=False), gr.update(visible=True), None
                     last_update_time = current_time
         
         # Final yield to ensure all logs are shown
-        yield logs, gr.update(visible=True, interactive=False), gr.update(visible=True), None
+        yield filter_logs(logs), gr.update(visible=True, interactive=False), gr.update(visible=True), None
     except Exception as e:
         logs += f"\nError running process: {str(e)}\n"
-        yield logs, gr.update(visible=True, interactive=False), gr.update(visible=True), None
+        yield filter_logs(logs), gr.update(visible=True, interactive=False), gr.update(visible=True), None
     finally:
         if current_process:
             if current_process.stdout:
